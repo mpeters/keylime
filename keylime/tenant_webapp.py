@@ -1,12 +1,13 @@
 #!/usr/bin/python3
 
 '''
-SPDX-License-Identifier: Apache-2.0
+SPDX-License-Identifier: BSD-2-Clause
 Copyright 2017 Massachusetts Institute of Technology.
 '''
 
 import base64
 import functools
+import jwt
 import os
 import ssl
 import traceback
@@ -23,7 +24,7 @@ from tornado.httpclient import AsyncHTTPClient
 from tornado.httputil import url_concat
 
 # from keylime import httpclient_requests
-from keylime import tornado_requests
+from keylime.requests_client import RequestsClient
 from keylime import cloud_verifier_common
 from keylime import tenant
 from keylime import common
@@ -31,7 +32,35 @@ from keylime import keylime_logging
 
 logger = keylime_logging.init_logging('tenant_webapp')
 config = common.get_config()
+
+# auth
+api_user = os.getenv('KL_API_USER')
+api_pass = os.getenv('KL_API_PASS')
+
+# jwt
+jwt_dsa = config.get('cloud_verifier', 'jwt_dsa')
+jwt_hmac_passphrase = config.get('cloud_verifier', 'jwt_hmac_passphrase')
+
 tenant_templ = tenant.Tenant()
+my_cert, my_priv_key = tenant_templ.get_tls_context()
+cert = (my_cert, my_priv_key)
+if config.getboolean('general', "enable_tls"):
+    tls_enabled = True
+else:
+    tls_enabled = False
+    cert = ""
+    logger.warning(
+        "TLS is currently disabled, keys will be sent in the clear! Should only be used for testing")
+
+verifier_ip = config.get('cloud_verifier', 'cloudverifier_ip')
+verifier_port = config.get('cloud_verifier', 'cloudverifier_port')
+verifier_base_url = (
+    f'{verifier_ip}:{verifier_port}')
+
+registrar_ip = config.get('registrar', 'registrar_ip')
+registrar_tls_port = config.get('registrar', 'registrar_tls_port')
+registrar_base_tls_url = (
+    f'{registrar_ip}:{registrar_tls_port}')
 
 
 class Agent_Init_Types:
@@ -286,9 +315,17 @@ class AgentsHandler(BaseHandler):
 
     async def get_agent_state(self, agent_id):
         try:
-            res = tornado_requests.request("GET",
-                                        "http://%s:%s/agents/%s"%(tenant_templ.cloudverifier_ip,tenant_templ.cloudverifier_port,agent_id),context=tenant_templ.cloudverifier_context)
-            response = await res
+            logger.debug('Getting token....')
+            token = tenant_templ.get_token()
+            my_token = jwt.decode(token, verify=False)
+            logger.debug('JWT token: ', my_token)
+            get_agent_state = RequestsClient(verifier_base_url, tls_enabled)
+            response = get_agent_state.get(
+                (f'/agents/{agent_id}'),
+                headers={"Authorization": "Bearer " + token},
+                cert=cert,
+                verify=False
+            )
 
         except Exception as e:
             logger.error("Status command response: %s:%s Unexpected response from Cloud Verifier." % (
@@ -362,9 +399,13 @@ class AgentsHandler(BaseHandler):
 
         # If no agent ID, get list of all agents from Registrar
         try:
-            res = tornado_requests.request("GET",
-                                        "http://%s:%s/agents/"%(tenant_templ.registrar_ip,tenant_templ.registrar_port),context=tenant_templ.registrar_context)
-            response = await res
+            get_agents = RequestsClient(
+                registrar_base_tls_url, tls_enabled)
+            response = get_agents.get(
+                (f'/agents/'),
+                cert=cert,
+                verify=False
+            )
 
         except Exception as e:
             logger.error("Status command response: %s:%s Unexpected response from Registrar." % (
@@ -613,6 +654,39 @@ def start_tornado(tornado_server, port):
     logger.info("Tornado finished")
 
 
+def get_tls_context():
+    ca_cert = config.get('tenant', 'ca_cert')
+    my_cert = config.get('tenant', 'my_cert')
+    my_priv_key = config.get('tenant', 'private_key')
+
+    tls_dir = config.get('tenant', 'tls_dir')
+
+    if tls_dir == 'default':
+        ca_cert = 'cacert.crt'
+        my_cert = 'client-cert.crt'
+        my_priv_key = 'client-private.pem'
+        tls_dir = 'cv_ca'
+
+    # this is relative path, convert to absolute in WORK_DIR
+    if tls_dir[0] != '/':
+        tls_dir = os.path.abspath('%s/%s' % (common.WORK_DIR, tls_dir))
+
+    logger.info(f"Setting up client TLS in {tls_dir}")
+
+    ca_path = "%s/%s" % (tls_dir, ca_cert)
+    my_cert = "%s/%s" % (tls_dir, my_cert)
+    my_priv_key = "%s/%s" % (tls_dir, my_priv_key)
+
+    context = ssl.create_default_context()
+    context.load_verify_locations(cafile=ca_path)
+    context.load_cert_chain(
+        certfile=my_cert, keyfile=my_priv_key)
+    context.verify_mode = ssl.CERT_REQUIRED
+    context.check_hostname = config.getboolean(
+        'general', 'tls_check_hostnames')
+    return context
+
+
 def main(argv=sys.argv):
     """Main method of the Tenant Webapp Server.  This method is encapsulated in a function for packaging to allow it to be
     called as a function by an external program."""
@@ -649,9 +723,9 @@ def main(argv=sys.argv):
     ])
 
     # WebApp Server TLS
-    server_context, x = tenant_templ.get_tls_context()
+    server_context = get_tls_context()
     server_context.check_hostname = False # config.getboolean('general','tls_check_hostnames')
-    server_context.verify_mode = ssl.CERT_NONE # ssl.CERT_REQUIRED
+    server_context.verify_mode = ssl.CERT_NONE  # ssl.CERT_REQUIRED
 
     # Set up server
     server = tornado.httpserver.HTTPServer(app, ssl_options=server_context)

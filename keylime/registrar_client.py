@@ -175,7 +175,6 @@ def doRegisterAgent(registrar_ip, registrar_port, agent_id, tpm_version, pub_ek,
             exit()
         else:
             logger.exception(e)
-
     return None
 
 

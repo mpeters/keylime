@@ -39,3 +39,16 @@ class VerfierMain(Base):
     hash_alg = Column(String(10))
     enc_alg = Column(String(10))
     sign_alg = Column(String(10))
+
+
+class User(Base):
+    __tablename__ = 'users'
+    user_id = Column(Integer, primary_key=True)
+    username = Column(String(80), unique=True, nullable=False)
+    password = Column(String(80), unique=True, nullable=False)
+    email = Column(String(120), unique=True, nullable=False)
+    group_id = Column(Integer, nullable=False)
+    role_id = Column(Integer,  nullable=False)
+
+    def __repr__(self):
+        return '<User %r>' % self.username

@@ -4,21 +4,28 @@ SPDX-License-Identifier: Apache-2.0
 Copyright 2017 Massachusetts Institute of Technology.
 '''
 
+import datetime
+import fnmatch
+import jwt
 import traceback
 import sys
 import functools
 import asyncio
 import tornado.ioloop
 import tornado.web
+from urllib.parse import urlparse
 import keylime.tornado_requests as tornado_requests
 
 from keylime import common
 from keylime import keylime_logging
 from keylime import cloud_verifier_common
 from keylime import revocation_notifier
+from keylime.keylime_auth import jwtauth
+from keylime.crypto import get_random_string
+from werkzeug.security import generate_password_hash, check_password_hash
 
 # Database imports
-from keylime.db.verifier_db import VerfierMain
+from keylime.db.verifier_db import VerfierMain, User
 from keylime.db.keylime_db import DBEngineManager, SessionManager
 from sqlalchemy.exc import SQLAlchemyError
 
@@ -33,6 +40,40 @@ if sys.version_info[0] < 3:
     raise Exception("Python 3 or a more recent version is required.")
 
 config = common.get_config()
+
+jwt_hmac_passphrase = config.get('cloud_verifier', 'jwt_hmac_passphrase')
+jwt_dsa = config.get('cloud_verifier', 'jwt_dsa')
+
+JWT_PREFIX = 'Bearer '
+JWT_SUPPORTED_DSA = ["HS256", "HS384", "HS512"]
+
+drivername = config.get('cloud_verifier', 'drivername')
+
+if drivername == 'sqlite':
+    database = "%s/%s" % (common.WORK_DIR,
+                          config.get('cloud_verifier', 'database'))
+    # Create the path to where the sqlite database will be store with a perm umask of 077
+    os.umask(0o077)
+    kl_dir = os.path.dirname(os.path.abspath(database))
+    if not os.path.exists(kl_dir):
+        os.makedirs(kl_dir, 0o700)
+
+    url = URL(
+        drivername=drivername,
+        username='',
+        password='',
+        host='',
+        database=(database)
+    )
+else:
+    url = URL(
+        drivername=drivername,
+        username=config.get('cloud_verifier', 'username'),
+        password=config.get('cloud_verifier', 'password'),
+        host=config.get('cloud_verifier', 'host'),
+        database=config.get('cloud_verifier', 'database')
+    )
+
 
 try:
     engine = DBEngineManager().make_engine('cloud_verifier')
@@ -71,6 +112,7 @@ def _from_db_obj(agent_db_obj):
 
 
 class BaseHandler(tornado.web.RequestHandler, SessionManager):
+
     def prepare(self):
         super(BaseHandler, self).prepare()
 
@@ -119,6 +161,187 @@ class MainHandler(tornado.web.RequestHandler):
             self, 405, "Not Implemented: Use /agents/ interface instead")
 
 
+class AuthHandler(BaseHandler):
+
+    def get(self, *args, **kwargs):
+        session = self.make_session(engine)
+        rest_params = common.get_restful_params(self.request.uri)
+        if rest_params is None:
+            common.echo_json_response(
+                self, 405, "Not Implemented: Use /auth/ interface")
+            return
+
+        if "auth" not in rest_params:
+            common.echo_json_response(self, 400, "uri not supported")
+            logger.warning(
+                'GET returning 400 response. uri not supported: ' + self.request.path)
+            return
+
+        username = self.get_argument("username")
+        password = self.get_argument("password")
+
+        user = session.query(User).filter(User.username == username).first()
+        if user is not None and user.username == username:
+            if check_password_hash(user.password, password):
+                encoded = jwt.encode({
+                    'group_id': user.group_id,
+                    'role_id': user.role_id,
+                    'exp': datetime.datetime.utcnow() + datetime.timedelta(minutes=1)},
+                    jwt_hmac_passphrase,
+                    jwt_dsa
+                ).decode('utf-8')
+                response = {'token': encoded}
+                common.echo_json_response(
+                    self, 200, response)
+            else:
+                logger.error(f"User {username} authorization failed")
+                common.echo_json_response(
+                    self, 401, "User %s authorization failed" % (username))
+        else:
+            logger.error(f"User {username} account not found")
+            common.echo_json_response(
+                self, 404, "User account %s not found" % (username))
+
+
+@jwtauth
+class UsersHandler(BaseHandler):
+    """
+        User registration, should only be allowed by admin
+    """
+
+    def patch(self):
+        """ Update user details. Must be admin or user themselves
+        """
+        pass
+
+    def get(self):
+        """Get user or users
+        """
+        session = self.make_session(engine)
+        request = self.request.uri
+        uripath = urlparse(request)
+
+        if "username" in uripath.query:
+            username = self.get_argument("username")
+
+            try:
+                user = session.query(User).filter(
+                    User.username == username).first()
+            except SQLAlchemyError as e:
+                logger.error(f'SQLAlchemy Error: {e}')
+
+            if user is not None:
+                userdata = {
+                    'user_id': user.user_id,
+                    'username': user.username,
+                    'email': user.email,
+                    'group_id': user.group_id,
+                    'role_id': user.role_id
+                }
+                common.echo_json_response(self, 200, "Success", {
+                    'user': userdata})
+            else:
+                logger.error(f"User: {username} not found")
+                common.echo_json_response(
+                    self, 200, f"User: {username} not found")
+        else:
+            json_response = session.query(User.username).all()
+            common.echo_json_response(self, 200, "Success", {
+                'users': json_response})
+
+    def delete(self):
+        """Delete user (not admin!)
+        """
+        session = self.make_session(engine)
+        username = self.get_argument("username")
+
+        token = self.request.headers.get("Authorization")[len(JWT_PREFIX):]
+        payload = jwt.decode(
+            token, jwt_hmac_passphrase, algorithms=jwt_dsa)
+
+        try:
+            user = session.query(User).filter(
+                User.username == username).first()
+        except SQLAlchemyError as e:
+            logger.error(f'SQLAlchemy Error: {e}')
+
+        if payload['role_id'] == 1:
+            print('role_id', )
+            if username == 'admin':
+                logger.error("Cannot delete admin user")
+                common.echo_json_response(
+                    self, 409, "Cannot delete admin user")
+            elif user is not None and user.username == username:
+                try:
+                    session.delete(user)
+                    session.commit()
+                    logger.info(f"Deleted {user.username}")
+                    common.echo_json_response(
+                        self, 409, f"Deleted {user.username}")
+                except SQLAlchemyError as e:
+                    logger.error(f'SQLAlchemy Error: {e}')
+            else:
+                logger.error(f"User {username} not found")
+                common.echo_json_response(
+                    self, 409, f"User {username} not found")
+        else:
+            logger.error(f"Only admin user can delete user account")
+            common.echo_json_response(
+                self, 409, "Only admin user can delete user account")
+
+    def post(self):
+        request = self.request.uri
+        uripath = urlparse(request)
+
+        if "register" in uripath.path:
+            # Register a new user
+            session = self.make_session(engine)
+            new_username = self.get_argument("username")
+            new_password = self.get_argument("password")
+            new_email = self.get_argument("email")
+            new_group_id = self.get_argument("group_id")
+            new_role_id = self.get_argument("role_id")
+            token = self.request.headers.get("Authorization")[len(JWT_PREFIX):]
+            payload = jwt.decode(
+                token, jwt_hmac_passphrase, algorithms=jwt_dsa)
+
+            try:
+                user = session.query(User).filter(
+                    User.username == new_username).first()
+            except SQLAlchemyError as e:
+                logger.error(f'SQLAlchemy Error: {e}')
+
+            if payload['role_id'] == 1:
+                if user is not None and user.username == new_username:
+                    logger.error(f"Username {new_username} already exists")
+                    common.echo_json_response(
+                        self, 409, "User %s already exists" % (new_username))
+                else:
+                    try:
+                        new_user = User(username=new_username,
+                                        password=generate_password_hash(
+                                            new_password),
+                                        email=new_email,
+                                        group_id=new_group_id,
+                                        role_id=new_role_id)
+                        session.add(new_user)
+                        session.commit()
+                    except SQLAlchemyError as e:
+                        logger.error(f'SQLAlchemy Error: {e}')
+                        common.echo_json_response(
+                            self, 500, "Internal server error %s " % (e))
+                    logger.info(
+                        f"Username {new_username} registered successfully")
+                    common.echo_json_response(
+                        self, 200, "Username %s registered successfully" % (new_username))
+            else:
+                logger.info(
+                    f"Only admin users are authorized to add new users")
+                common.echo_json_response(
+                    self, 409, "Only admin users are authorized to add new users")
+
+
+@jwtauth
 class AgentsHandler(BaseHandler):
     def head(self):
         """HEAD not supported"""
@@ -617,6 +840,30 @@ class AgentsHandler(BaseHandler):
             logger.exception(e)
 
 
+def check_user_db():
+    """ Checks that admin account exists, if not it will create one
+    and warn about default password
+    """
+    session = SessionManager().make_session(engine)
+    user = session.query(User).filter(User.username == "admin").first()
+    admin_pass = 'changeme'
+    if user is None:
+        logger.info("Creating admin user")
+        new_user = User(username="admin", password=generate_password_hash(
+            admin_pass), email="admin@localhost", group_id="1", role_id="1")
+        try:
+            session.add(new_user)
+            session.commit()
+        except SQLAlchemyError as e:
+            logger.error(f'SQLAlchemy Error: {e}')
+        logger.warn(
+            f"Admin password is: {admin_pass} THIS MUST BE CHANGED IMMEDIATELY!!")
+    else:
+        if check_password_hash(user.password, admin_pass):
+            logger.error(
+                'WARNING! Using the default Admin password is PUTTING YOUR SYSTEM AT RISK!')
+
+
 def start_tornado(tornado_server, port):
     tornado_server.listen(port)
     print("Starting Torando on port " + str(port))
@@ -653,15 +900,32 @@ def main(argv=sys.argv):
         agent_ids = session.query(VerfierMain.agent_id).all()
         logger.info("agent ids in db loaded from file: %s" % agent_ids)
 
+    check_user_db()
+
     logger.info('Starting Cloud Verifier (tornado) on port ' +
                 cloudverifier_port + ', use <Ctrl-C> to stop')
 
+    settings = {
+        'debug': True,
+        'autoreload': False,
+        "xsrf_cookies": False,  # change me!
+    }
+
     app = tornado.web.Application([
         (r"/(?:v[0-9]/)?agents/.*", AgentsHandler),
+        (r"/(?:v[0-9]/)?auth.*", AuthHandler),
+        (r"/(?:v[0-9]/)?user.*", UsersHandler),
         (r".*", MainHandler),
-    ])
+    ], **settings)
 
     context = cloud_verifier_common.init_mtls()
+
+    if jwt_dsa not in JWT_SUPPORTED_DSA:
+        logger.error(f'Unsupported Digital Signature Algorithm: {jwt_dsa}')
+        exit()
+
+    if fnmatch.fnmatch(jwt_dsa, 'HS*'):
+        logger.info(f'Using HMAC Based Algorithm for JWT: {jwt_dsa}')
 
     # after TLS is up, start revocation notifier
     if config.getboolean('cloud_verifier', 'revocation_notifier'):
